@@ -1,0 +1,41 @@
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import multer from 'multer';
+import XLSX from 'xlsx';
+import { randomUUID } from 'crypto';
+dotenv.config();
+const app=express();
+app.use(cors({origin:process.env.CLIENT_URL||'http://localhost:5173'}));
+app.use(express.json({limit:'2mb'}));
+const {Schema,model}=mongoose;
+const User=model('User',new Schema({name:{type:String,required:true},email:{type:String,unique:true,required:true},passwordHash:{type:String,required:true},role:{type:String,default:'admin'}},{timestamps:true}));
+const Hall=model('Hall',new Schema({name:{type:String,required:true},building:{type:String,default:'Main Block'},floor:{type:Number,default:1},rows:{type:Number,required:true,min:1},columns:{type:Number,required:true,min:1},capacity:{type:Number,required:true,min:1},status:{type:String,enum:['Available','Maintenance'],default:'Available'}},{timestamps:true}));
+const Student=model('Student',new Schema({registerNumber:{type:String,unique:true,required:true},name:{type:String,required:true},department:{type:String,default:'CSE'},subjectCode:{type:String,default:'GENERAL'}},{timestamps:true}));
+const Allocation=model('Allocation',new Schema({examName:String,examDate:String,createdBy:String,assignments:[Schema.Types.Mixed],summary:Schema.Types.Mixed},{timestamps:true}));
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:5*1024*1024}});
+const auth=(req,res,next)=>{try{const h=req.headers.authorization||'';const token=h.startsWith('Bearer ')?h.slice(7):'';req.user=jwt.verify(token,process.env.JWT_SECRET||'dev_only_change_me');next()}catch{return res.status(401).json({message:'Please sign in again.'})}};
+const asyncRoute=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
+app.get('/api/health',(req,res)=>res.json({ok:true,service:'SmartExam API'}));
+app.post('/api/auth/register',asyncRoute(async(req,res)=>{const count=await User.countDocuments();if(count>0)return res.status(403).json({message:'Admin registration is closed. Ask an existing administrator.'});const {name,email,password}=req.body;if(!name||!email||!password||password.length<8)return res.status(400).json({message:'Enter name, email and a password of at least 8 characters.'});const user=await User.create({name,email:email.toLowerCase(),passwordHash:await bcrypt.hash(password,12)});const token=jwt.sign({id:user.id,email:user.email,role:user.role},process.env.JWT_SECRET||'dev_only_change_me',{expiresIn:'12h'});res.status(201).json({token,user:{id:user.id,name:user.name,email:user.email}})}));
+app.post('/api/auth/login',asyncRoute(async(req,res)=>{const user=await User.findOne({email:String(req.body.email||'').toLowerCase()});if(!user||!await bcrypt.compare(req.body.password||'',user.passwordHash))return res.status(401).json({message:'Invalid email or password.'});const token=jwt.sign({id:user.id,email:user.email,role:user.role},process.env.JWT_SECRET||'dev_only_change_me',{expiresIn:'12h'});res.json({token,user:{id:user.id,name:user.name,email:user.email}})}));
+app.get('/api/auth/me',auth,(req,res)=>res.json({user:req.user}));
+app.get('/api/halls',auth,asyncRoute(async(req,res)=>res.json(await Hall.find().sort({name:1}))));
+app.post('/api/halls',auth,asyncRoute(async(req,res)=>{const d=req.body;const rows=Number(d.rows),columns=Number(d.columns);if(!d.name||rows<1||columns<1)return res.status(400).json({message:'Hall name, rows and columns are required.'});res.status(201).json(await Hall.create({...d,rows,columns,capacity:rows*columns}))}));
+app.put('/api/halls/:id',auth,asyncRoute(async(req,res)=>{const d=req.body;if(d.rows&&d.columns)d.capacity=Number(d.rows)*Number(d.columns);const hall=await Hall.findByIdAndUpdate(req.params.id,d,{new:true,runValidators:true});if(!hall)return res.status(404).json({message:'Hall not found.'});res.json(hall)}));
+app.delete('/api/halls/:id',auth,asyncRoute(async(req,res)=>{await Hall.findByIdAndDelete(req.params.id);res.json({ok:true})}));
+app.get('/api/students',auth,asyncRoute(async(req,res)=>res.json(await Student.find().sort({registerNumber:1}))));
+app.post('/api/students',auth,asyncRoute(async(req,res)=>{const d=req.body;if(!d.registerNumber||!d.name)return res.status(400).json({message:'Register number and name are required.'});res.status(201).json(await Student.create({...d,registerNumber:String(d.registerNumber).trim(),subjectCode:d.subjectCode||'GENERAL'}))}));
+app.delete('/api/students/:id',auth,asyncRoute(async(req,res)=>{await Student.findByIdAndDelete(req.params.id);res.json({ok:true})}));
+app.post('/api/students/import',auth,upload.single('file'),asyncRoute(async(req,res)=>{if(!req.file)return res.status(400).json({message:'Choose a CSV or Excel file.'});const wb=XLSX.read(req.file.buffer,{type:'buffer'});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});const clean=rows.map(r=>({registerNumber:String(r.registerNumber||r.RegisterNumber||r.register_number||'').trim(),name:String(r.name||r.Name||'').trim(),department:String(r.department||r.Department||'CSE').trim(),subjectCode:String(r.subjectCode||r.SubjectCode||r.subject_code||'GENERAL').trim()})).filter(s=>s.registerNumber&&s.name);let inserted=0,skipped=0;for(const s of clean){try{await Student.updateOne({registerNumber:s.registerNumber},{$set:s},{upsert:true});inserted++}catch{skipped++}}res.json({inserted,skipped,received:rows.length})}));
+function allocate(students,halls){const usable=halls.filter(h=>h.status!=='Maintenance').map(h=>({...h,capacity:Number(h.capacity)||Number(h.rows)*Number(h.columns)}));const total=usable.reduce((n,h)=>n+h.capacity,0);if(students.length>total)throw Object.assign(new Error(`Need ${students.length} seats but only ${total} are available.`),{status:400});const ordered=[...students].sort((a,b)=>String(a.subjectCode).localeCompare(String(b.subjectCode))||String(a.registerNumber).localeCompare(String(b.registerNumber)));const assignments=[];let idx=0;for(const hall of usable){const used=[];for(let seat=1;seat<=hall.capacity&&idx<ordered.length;seat++){const student=ordered[idx++];const row=Math.floor((seat-1)/(hall.columns||10))+1;const col=((seat-1)%(hall.columns||10))+1;used.push({studentId:student._id,registerNumber:student.registerNumber,name:student.name,department:student.department,subjectCode:student.subjectCode,hallId:hall._id,hallName:hall.name,seatNumber:seat,row,column:col});}assignments.push(...used)}// Report adjacent same-subject pairs horizontally; heuristic does not guarantee zero conflicts.
+let conflicts=0;for(const a of assignments){const b=assignments.find(x=>String(x.hallId)===String(a.hallId)&&x.row===a.row&&x.column===a.column+1);if(b&&b.subjectCode===a.subjectCode)conflicts++}
+return {assignments,summary:{students:assignments.length,hallsUsed:new Set(assignments.map(a=>String(a.hallId))).size,totalCapacity:total,utilization:total?Math.round(assignments.length/total*100):0,adjacentSameSubjectPairs:conflicts}}}
+app.post('/api/allocations/generate',auth,asyncRoute(async(req,res)=>{const students=await Student.find();const halls=await Hall.find();if(!students.length||!halls.length)return res.status(400).json({message:'Add students and halls before generating an allocation.'});const {assignments,summary}=allocate(students,halls);const doc=await Allocation.create({examName:req.body.examName||'End Semester Examination',examDate:req.body.examDate||new Date().toISOString().slice(0,10),createdBy:req.user.id,assignments,summary});res.status(201).json(doc)}));
+app.get('/api/allocations/latest',auth,asyncRoute(async(req,res)=>res.json(await Allocation.findOne().sort({createdAt:-1})||null)));
+app.use((err,req,res,next)=>{console.error(err);res.status(err.status|| (err.code===11000?409:500)).json({message:err.code===11000?'That register number or email already exists.':err.message||'Unexpected server error.'})});
+const port=process.env.PORT||5000;
+mongoose.connect(process.env.MONGODB_URI||'mongodb://127.0.0.1:27017/smart_exam').then(()=>app.listen(port,()=>console.log(`SmartExam API listening on ${port}`))).catch(e=>{console.error('MongoDB connection failed:',e.message);process.exit(1)});
